@@ -5,6 +5,8 @@ from typing import List, Optional
 import sqlite3
 import pytz
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import io
 
 app = FastAPI()
 
@@ -308,5 +310,67 @@ def get_daily_summary(days: int = Query(7, ge=1, description="Número de dias pa
             "end_date": end_date.strftime("%Y-%m-%d"),
             "daily_summary": results
         }
+    finally:
+        conn.close()
+
+@app.get("/access_logs/all", summary="Retorna todos os logs sem filtro")
+def get_all_logs(limit: int = Query(1000, ge=1, le=10000)):
+    conn, cursor = get_db()
+    try:
+        cursor.execute("""
+            SELECT * FROM access_logs 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (limit,))
+        logs = [dict(row) for row in cursor.fetchall()]
+        return {"total": len(logs), "data": logs}
+    finally:
+        conn.close()
+
+@app.get("/backup/sqlite", summary="Gera e retorna o backup SQL do banco de dados", tags=["Backup"])
+def backup_sqlite():
+    conn = sqlite3.connect("analytics.db")
+    try:
+        # Gera o dump SQL
+        dump_buffer = io.StringIO()
+        for line in conn.iterdump():
+            dump_buffer.write(f"{line}\n")
+        dump_buffer.seek(0)
+
+        # Retorna como arquivo para download
+        return StreamingResponse(
+            iter([dump_buffer.getvalue()]),
+            media_type="application/sql",
+            headers={"Content-Disposition": "attachment; filename=backup_analytics.sql"}
+        )
+    finally:
+        conn.close()
+
+@app.get("/stats/hourly_access", summary="Acessos por hora do dia (0-23)")
+def get_hourly_access():
+    conn, cursor = get_db()
+    try:
+        cursor.execute("""
+            SELECT strftime('%H', timestamp) as hour, COUNT(*) as count
+            FROM access_logs
+            GROUP BY hour
+            ORDER BY hour
+        """)
+        return {"hourly_access": [dict(row) for row in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/stats/last_access_per_user", summary="Último acesso de cada usuário")
+def get_last_access_per_user(limit: int = Query(100, ge=1, le=1000)):
+    conn, cursor = get_db()
+    try:
+        cursor.execute("""
+            SELECT user_id, MAX(timestamp) as last_access
+            FROM access_logs
+            GROUP BY user_id
+            ORDER BY last_access DESC
+            LIMIT ?
+        """, (limit,))
+        return {"last_access_per_user": [dict(row) for row in cursor.fetchall()]}
     finally:
         conn.close()
