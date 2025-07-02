@@ -1,12 +1,13 @@
 from fastapi import FastAPI, Request, Query, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict
 import sqlite3
 import pytz
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import io
+from collections import defaultdict
 
 app = FastAPI()
 
@@ -372,5 +373,237 @@ def get_last_access_per_user(limit: int = Query(100, ge=1, le=1000)):
             LIMIT ?
         """, (limit,))
         return {"last_access_per_user": [dict(row) for row in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+# novas rotas 
+
+@app.get("/access_logs/month_year", summary="Filtra logs por mês e ano (Ex: julho de 2025)", tags=["Acessos por Mês/Ano"])
+def get_logs_by_month_year(
+    mes: int = Query(..., ge=1, le=12, description="Mês (1 a 12)"),
+    ano: int = Query(..., ge=2000, le=2100, description="Ano (ex: 2025)"),
+    limit: int = Query(1000, ge=1, le=10000, description="Limite de resultados")
+):
+    conn, cursor = get_db()
+    try:
+        # Formata o mês com zero à esquerda se for necessário (ex: '07')
+        mes_str = f"{mes:02d}"
+        ano_str = str(ano)
+
+        cursor.execute("""
+            SELECT * FROM access_logs
+            WHERE strftime('%m', timestamp) = ? AND strftime('%Y', timestamp) = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (mes_str, ano_str, limit))
+
+        logs = [dict(row) for row in cursor.fetchall()]
+        return {
+            "mes": mes,
+            "ano": ano,
+            "total": len(logs),
+            "data": logs
+        }
+    finally:
+        conn.close()
+
+@app.get("/stats/pages_by_month_year", summary="Contagem de acessos e usuários únicos por página para um mês/ano com acumulados" , tags=["Acessos por Mês/Ano"])
+def get_page_counts_and_uniques_by_month_year(
+    mes: int = Query(..., ge=1, le=12, description="Mês (1 a 12)"),
+    ano: int = Query(..., ge=2000, le=2100, description="Ano (ex: 2025)")
+):
+    conn, cursor = get_db()
+    try:
+        # Definir intervalo de datas do mês
+        start_date = f"{ano}-{mes:02d}-01"
+        if mes == 12:
+            end_date = f"{ano+1}-01-01"
+        else:
+            end_date = f"{ano}-{mes+1:02d}-01"
+
+        # ---------- Contagem de acessos por página no mês ----------
+        cursor.execute("""
+            SELECT page, COUNT(*) as count_in_month
+            FROM access_logs
+            WHERE timestamp >= ? AND timestamp < ?
+            GROUP BY page
+        """, (start_date, end_date))
+        month_counts = {row["page"]: row["count_in_month"] for row in cursor.fetchall()}
+
+        # ---------- Usuários únicos por página no mês ----------
+        cursor.execute("""
+            SELECT page, COUNT(DISTINCT user_id) as unique_users_in_month
+            FROM access_logs
+            WHERE timestamp >= ? AND timestamp < ?
+            GROUP BY page
+        """, (start_date, end_date))
+        month_uniques = {row["page"]: row["unique_users_in_month"] for row in cursor.fetchall()}
+
+        # ---------- Contagem acumulada até o fim do mês ----------
+        cursor.execute("""
+            SELECT page, COUNT(*) as count_until_month
+            FROM access_logs
+            WHERE timestamp < ?
+            GROUP BY page
+        """, (end_date,))
+        until_month_counts = {row["page"]: row["count_until_month"] for row in cursor.fetchall()}
+
+        # ---------- Usuários únicos acumulados até o mês ----------
+        cursor.execute("""
+            SELECT page, COUNT(DISTINCT user_id) as unique_users_until_month
+            FROM access_logs
+            WHERE timestamp < ?
+            GROUP BY page
+        """, (end_date,))
+        until_month_uniques = {row["page"]: row["unique_users_until_month"] for row in cursor.fetchall()}
+
+        # ---------- Contagem total geral ----------
+        cursor.execute("""
+            SELECT page, COUNT(*) as count_total
+            FROM access_logs
+            GROUP BY page
+        """)
+        total_counts = {row["page"]: row["count_total"] for row in cursor.fetchall()}
+
+        # ---------- Usuários únicos total geral ----------
+        cursor.execute("""
+            SELECT page, COUNT(DISTINCT user_id) as unique_users_total
+            FROM access_logs
+            GROUP BY page
+        """)
+        total_uniques = {row["page"]: row["unique_users_total"] for row in cursor.fetchall()}
+
+        # ---------- Montar resposta final ----------
+        all_pages = set(month_counts) | set(month_uniques) | set(until_month_counts) | set(until_month_uniques) | set(total_counts) | set(total_uniques)
+        result = []
+        for page in sorted(all_pages):
+            result.append({
+                "page": page,
+                "count_in_month": month_counts.get(page, 0),
+                "unique_users_in_month": month_uniques.get(page, 0),
+                "count_until_month": until_month_counts.get(page, 0),
+                "unique_users_until_month": until_month_uniques.get(page, 0),
+                "count_total": total_counts.get(page, 0),
+                "unique_users_total": total_uniques.get(page, 0)
+            })
+
+        return {
+            "mes": mes,
+            "ano": ano,
+            "pages": result
+        }
+
+    finally:
+        conn.close()
+
+@app.get("/stats/recurrence_by_page", summary="Recorrência mensal de acessos por página (frequência de usuários)", tags=["Acessos por Mês/Ano"])
+def get_recurrence_by_page(
+    mes: int = Query(..., ge=1, le=12, description="Mês (1 a 12)"),
+    ano: int = Query(..., ge=2000, le=2100, description="Ano (ex: 2025)")
+):
+    conn, cursor = get_db()
+    try:
+        # Definindo intervalo do mês
+        start_date = f"{ano}-{mes:02d}-01"
+        if mes == 12:
+            end_date = f"{ano+1}-01-01"
+        else:
+            end_date = f"{ano}-{mes+1:02d}-01"
+
+        # Primeiro: pegar quantas vezes cada usuário acessou cada página no mês
+        cursor.execute("""
+            SELECT page, user_id, COUNT(*) as access_count
+            FROM access_logs
+            WHERE timestamp >= ? AND timestamp < ?
+            GROUP BY page, user_id
+        """, (start_date, end_date))
+        rows = cursor.fetchall()
+
+        # Estrutura: { page: { user_id: quantidade_de_acessos } }
+        page_user_counts = {}
+        for row in rows:
+            page = row["page"]
+            user_id = row["user_id"]
+            count = row["access_count"]
+            if page not in page_user_counts:
+                page_user_counts[page] = []
+            page_user_counts[page].append(count)
+
+        # Agora calcular frequência por quantidade de acessos
+        result = []
+        for page, user_counts in page_user_counts.items():
+            freq = {
+                "1x": 0,
+                "2x": 0,
+                "3x": 0,
+                "4x": 0,
+                "5x_or_more": 0
+            }
+            max_access = 0
+            for count in user_counts:
+                max_access = max(max_access, count)
+                if count == 1:
+                    freq["1x"] += 1
+                elif count == 2:
+                    freq["2x"] += 1
+                elif count == 3:
+                    freq["3x"] += 1
+                elif count == 4:
+                    freq["4x"] += 1
+                else:
+                    freq["5x_or_more"] += 1
+
+            result.append({
+                "page": page,
+                "month": mes,
+                "year": ano,
+                "user_access_frequency": freq,
+                "max_accesses_by_single_user": max_access
+            })
+
+        return {
+            "mes": mes,
+            "ano": ano,
+            "pages": result
+        }
+
+    finally:
+        conn.close()
+
+@app.get("/access_logs/by_page_and_month_year", summary="Retorna todos os logs de uma página específica em um mês/ano", tags=["Acessos por Mês/Ano"])
+def get_logs_by_page_and_month_year(
+    page: str = Query(..., description="Nome exato da página"),
+    mes: int = Query(..., ge=1, le=12, description="Mês (1 a 12)"),
+    ano: int = Query(..., ge=2000, le=2100, description="Ano (ex: 2025)"),
+    limit: int = Query(10000, ge=1, le=50000, description="Limite máximo de registros retornados")
+):
+    conn, cursor = get_db()
+    try:
+        # Definir intervalo de datas do mês
+        start_date = f"{ano}-{mes:02d}-01"
+        if mes == 12:
+            end_date = f"{ano+1}-01-01"
+        else:
+            end_date = f"{ano}-{mes+1:02d}-01"
+
+        cursor.execute("""
+            SELECT * FROM access_logs
+            WHERE page = ?
+            AND timestamp >= ?
+            AND timestamp < ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (page, start_date, end_date, limit))
+
+        logs = [dict(row) for row in cursor.fetchall()]
+
+        return {
+            "page": page,
+            "mes": mes,
+            "ano": ano,
+            "total": len(logs),
+            "data": logs
+        }
+
     finally:
         conn.close()
